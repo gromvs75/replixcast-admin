@@ -16,7 +16,7 @@ export default function LoginPage() {
     setLoading(true);
     setError(null);
 
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -27,48 +27,60 @@ export default function LoginPage() {
       return;
     }
 
-    if (data.session) {
-      router.push("/admin/orders");
-    }
-
-    setLoading(false);
+    router.push("/admin/orders");
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h1 className="text-lg font-semibold mb-4">Admin Login</h1>
+    <div className="flex min-h-[calc(100vh-80px)] items-center justify-center">
+      <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-lg">
+        <div className="mb-2 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+          ReplixCast
+        </div>
+        <h1 className="mb-1 text-center text-xl font-semibold text-slate-900">
+          Вход в админку
+        </h1>
+        <p className="mb-6 text-center text-xs text-slate-500">
+          Введите email и пароль администратора Supabase
+        </p>
+
+        {error && (
+          <div className="mb-4 rounded-lg bg-red-100 px-3 py-2 text-xs text-red-700">
+            {error}
+          </div>
+        )}
 
         <div className="mb-3">
-          <label className="block text-sm mb-1">Email</label>
+          <label className="mb-1 block text-xs font-medium text-slate-600">
+            Email
+          </label>
           <input
             type="email"
-            className="w-full rounded-md border px-3 py-2"
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-300"
+            placeholder="admin@example.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
           />
         </div>
 
         <div className="mb-4">
-          <label className="block text-sm mb-1">Password</label>
+          <label className="mb-1 block text-xs font-medium text-slate-600">
+            Пароль
+          </label>
           <input
             type="password"
-            className="w-full rounded-md border px-3 py-2"
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-300"
+            placeholder="Введите пароль"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
         </div>
 
-        {error && (
-          <div className="mb-3 text-sm text-red-600">{error}</div>
-        )}
-
         <button
           onClick={handleLogin}
           disabled={loading}
-          className="w-full rounded-md bg-black py-2 text-white hover:bg-slate-800 disabled:opacity-50"
+          className="flex w-full items-center justify-center rounded-lg bg-black px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:opacity-50"
         >
-          {loading ? "Logging in…" : "Login"}
+          {loading ? "Входим…" : "Войти"}
         </button>
       </div>
     </div>
