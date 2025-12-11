@@ -1,4 +1,5 @@
-// LOGIN DEBUG "use client";
+"use client";
+// LOGIN DEBUG
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
