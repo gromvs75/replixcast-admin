@@ -1,53 +1,92 @@
-import React from "react";
+"use client";
 
-export const metadata = {
-  title: "ReplixCast Admin",
-};
+import Link from "next/link";
+import { supabase } from "../../lib/supabaseClient";
+import { useRouter, usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 
-export default function AdminLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function AdminLayout({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const [isAuthChecked, setIsAuthChecked] = useState(false);
+  const [session, setSession] = useState<any>(null);
+
+  useEffect(() => {
+    const check = async () => {
+      const { data } = await supabase.auth.getSession();
+      setSession(data.session);
+      setIsAuthChecked(true);
+    };
+    check();
+  }, []);
+
+  // Показываем пустой экран, пока проверяем авторизацию
+  if (!isAuthChecked) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-slate-600">
+        Проверка доступа…
+      </div>
+    );
+  }
+
+  // Если нет сессии — отправляем на логин
+  if (!session) {
+    if (pathname !== "/admin/login") router.push("/admin/login");
+    return null;
+  }
+
+  const nav = [
+    { href: "/admin/orders", label: "Заявки" },
+    { href: "/admin/invoices", label: "Инвойсы" },
+    { href: "/admin/settings", label: "Настройки" },
+  ];
+
+  const logout = async () => {
+    await supabase.auth.signOut();
+    router.push("/admin/login");
+  };
+
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-900">
-      <header className="sticky top-0 z-20 border-b bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-xl bg-black text-center text-sm font-bold leading-8 text-white">
-              R
-            </div>
-            <div>
-              <div className="text-sm font-semibold tracking-tight">
-                ReplixCast Admin
-              </div>
-              <div className="text-xs text-slate-500">
-                Панель управления заявками
-              </div>
-            </div>
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      {/* TOP BAR */}
+      <header className="border-b border-slate-200 bg-white px-6 py-4 flex justify-between items-center shadow-sm">
+        <div className="flex items-center gap-2">
+          <div className="h-9 w-9 bg-black rounded-xl text-white flex items-center justify-center font-bold">
+            R
           </div>
+          <div>
+            <div className="text-sm font-semibold">ReplixCast Admin</div>
+            <div className="text-xs text-slate-500">Панель управления заявками</div>
+          </div>
+        </div>
 
-          <nav className="flex items-center gap-6 text-sm text-slate-600">
-            <a href="/admin/orders" className="hover:text-black">
-              Заявки
-            </a>
-            <a href="/admin/invoices" className="hover:text-black">
-              Инвойсы
-            </a>
-            <a href="/admin/settings" className="hover:text-black">
-              Настройки
-            </a>
-            <a
-              href="/admin/login"
-              className="text-red-600 hover:text-red-800 font-medium"
+        {/* NAVIGATION */}
+        <nav className="flex items-center gap-6 text-sm">
+          {nav.map((item) => (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={
+                pathname.startsWith(item.href)
+                  ? "font-semibold text-slate-900"
+                  : "text-slate-600 hover:text-slate-900"
+              }
             >
-              Выйти
-            </a>
-          </nav>
-          </div>
+              {item.label}
+            </Link>
+          ))}
+
+          <button
+            onClick={logout}
+            className="text-slate-500 hover:text-red-600 text-sm"
+          >
+            Выйти
+          </button>
+        </nav>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 py-6">{children}</main>
+      {/* CONTENT */}
+      <main className="p-6">{children}</main>
     </div>
   );
 }
