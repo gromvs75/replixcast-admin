@@ -1,0 +1,10 @@
+/* app/styles/globals.css */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Можно добавить что-то своё */
+body {
+  @apply bg-slate-50 text-slate-900;
+}

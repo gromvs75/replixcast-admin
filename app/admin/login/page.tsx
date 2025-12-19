@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "../../../lib/supabaseClient";
 
@@ -10,7 +10,27 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [checking, setChecking] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      if (!alive) return;
+
+      if (data.session) {
+        router.replace("/admin/orders");
+        return;
+      }
+      setChecking(false);
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [router]);
 
   const handleLogin = async () => {
     setLoading(true);
@@ -27,8 +47,12 @@ export default function LoginPage() {
       return;
     }
 
-    router.push("/admin/orders");
+    router.replace("/admin/orders");
   };
+
+  if (checking) {
+    return <div className="p-6 text-sm text-slate-500">Проверяю сессию…</div>;
+  }
 
   return (
     <div className="flex min-h-[calc(100vh-80px)] items-center justify-center">
