@@ -253,7 +253,7 @@ export async function POST(req: Request) {
 	}
 
 	// Log в БД (best-effort)
-	await supabaseAdmin
+	const { error: logErr } = await supabaseAdmin
 	  .from("lead_requests")
 	  .insert({
 		ip,
@@ -262,8 +262,12 @@ export async function POST(req: Request) {
 		message,
 		user_agent: ua,
 		referer,
-	  })
-	  .catch(() => null);
+	  });
+	
+	if (logErr) {
+	  // best-effort: не валим форму
+	  console.warn("lead_requests insert failed:", logErr.message);
+	}
 
 	const text =
 	  `🆕 <b>Новая заявка (lead)</b>\n` +
