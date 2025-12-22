@@ -4,14 +4,12 @@ import { useEffect, useState } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
-import FileListClient from "@/app/admin/orders/components/files/FileListClient";
-import FileListAdmin from "@/app/admin/orders/components/files/FileListAdmin";
-import AdminUpload from "@/app/admin/orders/components/files/AdminUpload";
+import OrderFiles from "@/app/admin/orders/components/files/OrderFiles";
 
 export default function OrderDetailsPage() {
   const router = useRouter();
-  const { id } = useParams();
-  const orderId = String(id);
+  const params = useParams();
+  const orderId = String((params as any)?.id || "");
 
   const [order, setOrder] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -66,13 +64,11 @@ export default function OrderDetailsPage() {
     const ok = prompt("Удалить НАВСЕГДА? Введи DELETE:") === "DELETE";
     if (!ok) return;
 
-    // ⚠️ это удалит только запись заказа.
-    // Если хочешь удалять ещё и файлы из storage + order_files — сделаем отдельным admin endpoint завтра.
     await supabase.from("orders").delete().eq("id", orderId).select();
-
     router.push("/admin/orders");
   };
 
+  if (!orderId) return <div className="p-6">Нет ID заявки</div>;
   if (loading) return <div className="p-6">Загрузка...</div>;
   if (!order) return <div className="p-6">Заявка не найдена</div>;
 
@@ -100,23 +96,19 @@ export default function OrderDetailsPage() {
       </div>
 
       <div className="bg-white p-5 shadow rounded-xl space-y-2">
-        <p><b>Имя:</b> {order.name}</p>
-        <p><b>Email:</b> {order.email}</p>
+        <p>
+          <b>Имя:</b> {order.name}
+        </p>
+        <p>
+          <b>Email:</b> {order.email}
+        </p>
         <p className="whitespace-pre-wrap">
           <b>Запрос:</b> {order.script}
         </p>
       </div>
 
-      <div className="space-y-3">
-        <h2 className="text-lg font-semibold">📎 Файлы клиента</h2>
-        <FileListClient orderId={orderId} />
-      </div>
-
-      <div className="space-y-3">
-        <h2 className="text-lg font-semibold">✅ Результат (админ)</h2>
-        <AdminUpload orderId={orderId} />
-        <FileListAdmin orderId={orderId} />
-      </div>
+      {/* ✅ Один компонент, который сам показывает клиентские и админские файлы + upload */}
+      <OrderFiles orderId={orderId} />
 
       {/* ✅ Действия */}
       {!inTrash ? (

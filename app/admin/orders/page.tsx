@@ -737,19 +737,27 @@ export default function AdminOrdersPage() {
         setOrders((prev) => prev.map((o) => (o.id === order.id ? { ...o, is_read: true } : o)));
       }
 
-      const [cRes, aRes] = await Promise.all([
-        authedFetch(`/api/orders/${order.id}/files`, { cache: "no-store" }),
-        authedFetch(`/api/admin/orders/${order.id}/files`, { cache: "no-store" }),
-      ]);
-
-      const cJson = await cRes.json();
-      const aJson = await aRes.json();
-
-      const cArr: OrderFile[] = Array.isArray(cJson) ? cJson : cJson.files || [];
-      const aArr: OrderFile[] = Array.isArray(aJson) ? aJson : aJson.files || [];
-
-      setClientFiles(cArr);
-      setAdminFiles(aArr);
+     const [cRes, aRes] = await Promise.all([
+       authedFetch(`/api/orders/${order.id}/files`, { cache: "no-store" as any }),
+       // ✅ берём канонический формат (как в OrderFiles.tsx)
+       authedFetch(`/api/admin/orders/${order.id}/files?role=all`, { cache: "no-store" as any }),
+     ]);
+     
+     const cJson = await cRes.json().catch(() => ({}));
+     const aJson = await aRes.json().catch(() => ({}));
+     
+     // ✅ public endpoint обычно отдаёт массив, но на всякий — поддержим и {files}/{clientFiles}
+     const cArr: OrderFile[] = Array.isArray(cJson)
+       ? cJson
+       : (Array.isArray((cJson as any)?.files) ? (cJson as any).files : (cJson as any)?.clientFiles) || [];
+     
+     // ✅ admin endpoint у тебя “канонический”: { clientFiles, adminFiles }
+     const aArr: OrderFile[] = Array.isArray(aJson)
+       ? aJson
+       : (Array.isArray((aJson as any)?.files) ? (aJson as any).files : (aJson as any)?.adminFiles) || [];
+     
+     setClientFiles(Array.isArray(cArr) ? cArr : []);
+     setAdminFiles(Array.isArray(aArr) ? aArr : []);
     } catch (e: any) {
       toast.error(e?.message || "Не удалось загрузить превью");
       setClientFiles([]);
