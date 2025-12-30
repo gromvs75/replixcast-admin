@@ -47,7 +47,10 @@ function getIp(req: Request) {
 }
 
 function escapeHtml(s: string) {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return (s || "")
+	.replace(/&/g, "&amp;")
+	.replace(/</g, "&lt;")
+	.replace(/>/g, "&gt;");
 }
 
 function safeFilename(name: string) {
@@ -55,6 +58,7 @@ function safeFilename(name: string) {
   return n.replace(/[^\w.\-]+/g, "_").slice(0, 180);
 }
 
+// File-like
 type WebFileLike = {
   name: string;
   type: string;
@@ -75,6 +79,7 @@ function asWebFileLike(v: any): WebFileLike | null {
 
 function pickMultipartFiles(fd: FormData): WebFileLike[] {
   const out: WebFileLike[] = [];
+
   const keys = ["files", "files[]", "file", "file[]", "upload", "uploads", "photo", "image", "avatar"];
 
   for (const k of keys) {
@@ -85,6 +90,7 @@ function pickMultipartFiles(fd: FormData): WebFileLike[] {
 	}
   }
 
+  // fallback: если ключи другие — пройдёмся по всем полям
   if (out.length === 0) {
 	for (const [, v] of fd.entries()) {
 	  const f = asWebFileLike(v);
@@ -199,6 +205,8 @@ async function telegramSendMessage(html: string) {
 }
 
 export async function POST(req: Request) {
+  const errors: string[] = [];
+
   try {
 	const origin = req.headers.get("origin") || "";
 	if (!isOriginAllowed(origin)) {
@@ -225,11 +233,9 @@ export async function POST(req: Request) {
 	  name = String(fd.get("name") || "").trim();
 	  email = String(fd.get("email") || "").trim();
 	  message = String(fd.get("message") || fd.get("description") || "").trim();
-
-	  // honeypot
 	  hp = String(fd.get("company") || fd.get("website") || "").trim();
-
 	  token = String(fd.get("cf-turnstile-response") || fd.get("turnstileToken") || "").trim();
+
 	  files = pickMultipartFiles(fd);
 	} else {
 	  const body = await req.json().catch(() => null);
@@ -286,7 +292,7 @@ export async function POST(req: Request) {
 		user_agent: ua,
 		referer,
 	  })
-	  .select("id, created_at")
+	  .select("id")
 	  .single();
 
 	if (leadErr || !lead) {
@@ -297,8 +303,8 @@ export async function POST(req: Request) {
 	const leadId = String(lead.id);
 
 	// 3.1) Upload files
+	const receivedFiles = files.map((f) => ({ name: f.name, size: f.size, type: f.type || "" }));
 	const uploaded: { path: string; name: string; size: number; type: string; bucket: string }[] = [];
-	const uploadErrors: { name: string; error: string }[] = [];
 
 	for (let i = 0; i < files.length; i++) {
 	  const file = files[i];
@@ -314,20 +320,18 @@ export async function POST(req: Request) {
 
 		if (up.error) {
 		  console.error("[storage upload] error:", up.error);
-		  uploadErrors.push({ name: safeName, error: up.error.message });
+		  errors.push(`storage.upload(${safeName}): ${up.error.message}`);
 		  continue;
 		}
 
 		uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
 	  } catch (e: any) {
 		console.error("[storage upload] exception:", e);
-		uploadErrors.push({ name: safeName, error: e?.message || "upload exception" });
+		errors.push(`storage.upload(${safeName}): ${e?.message || "unknown error"}`);
 	  }
 	}
 
-	// 3.2) lead_files insert
-	let leadFilesInsertError: string | null = null;
-
+	// 3.2) Insert lead_files + update lead_requests first file
 	if (uploaded.length > 0) {
 	  const rows = uploaded.map((u) => ({
 		lead_id: leadId,
@@ -341,10 +345,10 @@ export async function POST(req: Request) {
 	  const ins = await supabaseAdmin.from("lead_files").insert(rows as any);
 	  if (ins.error) {
 		console.error("[lead_files insert] error:", ins.error);
-		leadFilesInsertError = ins.error.message;
+		errors.push(`lead_files.insert: ${ins.error.message}`);
 	  }
 
-	  // 3.3) update lead_requests (ВАЖНО: по твоей схеме!)
+	  // lead_requests (твоя схема: file_type)
 	  const first = uploaded[0];
 	  const upd = await supabaseAdmin
 		.from("lead_requests")
@@ -358,6 +362,7 @@ export async function POST(req: Request) {
 
 	  if (upd.error) {
 		console.error("[lead_requests update file_*] error:", upd.error);
+		errors.push(`lead_requests.update: ${upd.error.message}`);
 	  }
 	}
 
@@ -383,17 +388,16 @@ export async function POST(req: Request) {
 	const tg = await telegramSendMessage(text);
 	if (!tg.ok) {
 	  console.error("[telegram] error:", tg.error);
-	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId }, { status: 500 });
+	  // лид уже создан — не ломаем клиенту, просто вернём предупреждение
+	  errors.push(`telegram: ${tg.error}`);
 	}
 
-	// ✅ ВОТ ЭТО ТЕБЕ СРАЗУ ПОКАЖЕТ, ВИДИТ ЛИ БЭК ФАЙЛЫ И ЧТО С НИМИ
 	return corsJson(req, {
 	  ok: true,
 	  leadId,
-	  receivedFiles: files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+	  receivedFiles,
 	  uploaded,
-	  uploadErrors,
-	  leadFilesInsertError,
+	  errors,
 	});
   } catch (e: any) {
 	console.error("[/api/request] error:", e);
