@@ -215,40 +215,38 @@ async function telegramSendMessage(html: string) {
   return { ok: true as const };
 }
 
-async function tryUpdateLeadRequestFileFields(leadId: string, first: any, filesCount: number) {
-  // пробуем разные названия колонок, чтобы не зависеть от схемы (file_type vs file_mime)
+async function tryUpdateLeadRequestFileFields(
+  leadId: string,
+  first: any,
+  filesCount: number
+) {
+  // ВАЖНО: НЕ пишем bucket/files_count — их часто нет в lead_requests,
+  // и тогда весь update падает, и в админке "нет файла".
   const payloadVariants: any[] = [
 	{
 	  file_path: first?.path ?? null,
 	  file_name: first?.name ?? null,
 	  file_mime: first?.type ?? null,
 	  file_size: first?.size ?? null,
-	  bucket: LEADS_BUCKET,
-	  files_count: filesCount,
 	},
 	{
 	  file_path: first?.path ?? null,
 	  file_name: first?.name ?? null,
-	  file_type: first?.type ?? null,
+	  file_type: first?.type ?? null, // на случай если колонка так названа
 	  file_size: first?.size ?? null,
-	  bucket: LEADS_BUCKET,
-	  files_count: filesCount,
 	},
 	{
+	  file_path: first?.path ?? null,
 	  file_name: first?.name ?? null,
-	  file_mime: first?.type ?? null,
 	  file_size: first?.size ?? null,
-	  bucket: LEADS_BUCKET,
-	  files_count: filesCount,
 	},
   ];
 
   for (const p of payloadVariants) {
 	const upd = await supabaseAdmin.from("lead_requests").update(p).eq("id", leadId);
 	if (!upd.error) return;
-	// если ошибка по колонке — попробуем следующий вариант
-	const msg = String(upd.error.message || "");
-	console.error("[lead_requests update file fields] error:", msg);
+
+	console.error("[lead_requests update file fields] error:", upd.error);
   }
 }
 
@@ -371,9 +369,9 @@ export async function POST(req: Request) {
 	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
 	}
 
-	// 3.2) lead_files insert (если таблица есть)
+	// 3.2) lead_files insert (если таблица есть) — робастно под разные схемы
 	if (uploaded.length > 0) {
-	  const rowsWithBucket = uploaded.map((u) => ({
+	  const rows_mime_bucket = uploaded.map((u) => ({
 		lead_id: leadId,
 		file_path: u.path,
 		file_name: u.name,
@@ -381,26 +379,58 @@ export async function POST(req: Request) {
 		file_size: u.size || null,
 		bucket: LEADS_BUCKET,
 	  }));
-
-	  const ins1 = await supabaseAdmin.from("lead_files").insert(rowsWithBucket as any);
-	  if (ins1.error) {
-		// возможно нет колонки bucket — попробуем без неё
-		console.error("[lead_files insert] error:", ins1.error);
-		const rowsNoBucket = uploaded.map((u) => ({
-		  lead_id: leadId,
-		  file_path: u.path,
-		  file_name: u.name,
-		  file_mime: u.type || null,
-		  file_size: u.size || null,
-		}));
-		const ins2 = await supabaseAdmin.from("lead_files").insert(rowsNoBucket as any);
-		if (ins2.error) console.error("[lead_files insert fallback] error:", ins2.error);
+	
+	  const rows_mime_noBucket = uploaded.map((u) => ({
+		lead_id: leadId,
+		file_path: u.path,
+		file_name: u.name,
+		file_mime: u.type || null,
+		file_size: u.size || null,
+	  }));
+	
+	  const rows_type_bucket = uploaded.map((u) => ({
+		lead_id: leadId,
+		file_path: u.path,
+		file_name: u.name,
+		file_type: u.type || null, // на случай если в таблице поле называется file_type
+		file_size: u.size || null,
+		bucket: LEADS_BUCKET,
+	  }));
+	
+	  const rows_type_noBucket = uploaded.map((u) => ({
+		lead_id: leadId,
+		file_path: u.path,
+		file_name: u.name,
+		file_type: u.type || null,
+		file_size: u.size || null,
+	  }));
+	
+	  // 4 попытки вставки (mime/type × bucket/no bucket)
+	  const attempts: Array<{ name: string; rows: any[] }> = [
+		{ name: "mime+bucket", rows: rows_mime_bucket },
+		{ name: "mime", rows: rows_mime_noBucket },
+		{ name: "type+bucket", rows: rows_type_bucket },
+		{ name: "type", rows: rows_type_noBucket },
+	  ];
+	
+	  let leadFilesInserted = false;
+	  for (const a of attempts) {
+		const ins = await supabaseAdmin.from("lead_files").insert(a.rows as any);
+		if (!ins.error) {
+		  leadFilesInserted = true;
+		  break;
+		}
+		console.error(`[lead_files insert ${a.name}] error:`, ins.error);
 	  }
-
-	  // 3.3) update lead_requests first file for compatibility
+	
+	  // 3.3) update lead_requests first file for compatibility (важно для админки)
+	  // Делаем это В ЛЮБОМ СЛУЧАЕ, даже если lead_files не вставился.
 	  await tryUpdateLeadRequestFileFields(leadId, uploaded[0], uploaded.length);
+	
+	  if (!leadFilesInserted) {
+		console.error("[lead_files] all insert attempts failed (but lead_requests updated).");
+	  }
 	}
-
 	// 4) Telegram
 	const filesLine =
 	  uploaded.length > 0
