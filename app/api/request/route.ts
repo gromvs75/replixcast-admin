@@ -4,43 +4,126 @@ import { createClient } from "@supabase/supabase-js";
 
 export const runtime = "nodejs";
 
+// --- Supabase admin (service role) ---
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+if (!supabaseUrl || !serviceRoleKey) {
+  throw new Error("Missing Supabase env: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
 const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// ENV
+// --- ENV ---
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const LEADS_BUCKET = process.env.LEADS_BUCKET || "leads";
 
-// CORS allowlist (Strato -> Vercel)
-// Пример: ALLOWED_ORIGINS=https://replixcast.de,https://www.replixcast.de,http://localhost:3000
+// ALLOWED_ORIGINS=https://replixcast.de,https://www.replixcast.de,http://localhost:3000
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Rate limit
-const RATE_LIMIT_WINDOW_SEC = 10 * 60; // 10 минут
-const RATE_LIMIT_MAX = 5; // 5 запросов за окно
+// --- Limits ---
+const MAX_FILES = 3;
+// ВАЖНО: если грузишь видео, Vercel/Next может упереться в лимит размера запроса.
+// Поэтому держим дефолт 4MB, но можно поднять через env MAX_FILE_MB.
+const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || "4");
+const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
 
-// Upload limits (для лида лучше держать умеренно; Telegram тоже имеет лимиты)
-const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
-const ALLOWED_MIME = [
-  "image/jpeg",
-  "image/png",
-  "application/pdf",
-  "video/mp4",
-  "video/quicktime",
-];
+// --- Rate limit ---
+const RATE_LIMIT_WINDOW_SEC = 10 * 60;
+const RATE_LIMIT_MAX = 5;
+
+// --- Helpers ---
+function isValidEmail(v: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}
+
+function getIp(req: Request) {
+  const fwd = req.headers.get("x-forwarded-for") || "";
+  const ip = fwd.split(",")[0]?.trim();
+  return ip || req.headers.get("x-real-ip") || "unknown";
+}
+
+function escapeHtml(s: string) {
+  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function safeFilename(name: string) {
+  const n = (name || "file").trim();
+  return n.replace(/[^\w.\-]+/g, "_").slice(0, 180);
+}
+
+// File-like
+type WebFileLike = {
+  name: string;
+  type: string;
+  size: number;
+  arrayBuffer: () => Promise<ArrayBuffer>;
+};
+
+function asWebFileLike(v: any): WebFileLike | null {
+  if (!v) return null;
+  if (typeof v?.arrayBuffer !== "function") return null;
+
+  const name = typeof v?.name === "string" && v.name ? String(v.name) : "upload.bin";
+  const type = typeof v?.type === "string" ? String(v.type) : "";
+  const size = typeof v?.size === "number" ? Number(v.size) : 0;
+
+  return { name, type, size, arrayBuffer: v.arrayBuffer.bind(v) };
+}
+
+// Забираем до 3 файлов: поддерживаем files / files[] / file / upload и т.п.
+function pickMultipartFiles(fd: FormData): WebFileLike[] {
+  const out: WebFileLike[] = [];
+
+  const keys = [
+	"files",
+	"files[]",
+	"file",
+	"file[]",
+	"photo",
+	"image",
+	"avatar",
+	"upload",
+	"uploads",
+  ];
+
+  for (const k of keys) {
+	const arr = fd.getAll(k);
+	for (const v of arr) {
+	  const f = asWebFileLike(v);
+	  if (f) out.push(f);
+	}
+  }
+
+  // fallback: если ключи другие — пройдёмся по всем полям
+  if (out.length === 0) {
+	for (const [, v] of fd.entries()) {
+	  const f = asWebFileLike(v);
+	  if (f) out.push(f);
+	}
+  }
+
+  // ограничение
+  return out.slice(0, MAX_FILES);
+}
+
+// --- CORS ---
+function isOriginAllowed(origin: string) {
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.length === 0) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+}
 
 function corsHeaders(origin: string) {
-  // Если allowlist пуст — разрешаем всё (удобно для тестов).
-  // Если задан — разрешаем ТОЛЬКО указанные origin.
   const allowOrigin =
-	ALLOWED_ORIGINS.length === 0
+	!origin
+	  ? "*"
+	  : ALLOWED_ORIGINS.length === 0
 	  ? "*"
 	  : ALLOWED_ORIGINS.includes(origin)
 	  ? origin
@@ -51,7 +134,7 @@ function corsHeaders(origin: string) {
 	"Access-Control-Allow-Methods": "POST, OPTIONS",
 	"Access-Control-Allow-Headers": "Content-Type",
 	"Access-Control-Max-Age": "86400",
-	"Vary": "Origin",
+	Vary: "Origin",
   };
 }
 
@@ -63,36 +146,17 @@ function corsJson(req: Request, body: any, init?: { status?: number }) {
   });
 }
 
-function isValidEmail(v: string) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
-}
-
-function getIp(req: Request) {
-  const fwd = req.headers.get("x-forwarded-for") || "";
-  const ip = fwd.split(",")[0]?.trim();
-  return ip || req.headers.get("x-real-ip") || "unknown";
-}
-
-function originAllowed(req: Request) {
-  if (ALLOWED_ORIGINS.length === 0) return true;
-  const origin = req.headers.get("origin") || "";
-  return ALLOWED_ORIGINS.includes(origin);
-}
-
-// ✅ Preflight для браузера (Strato -> Vercel)
 export async function OPTIONS(req: Request) {
   const origin = req.headers.get("origin") || "";
-
-  if (ALLOWED_ORIGINS.length > 0 && !ALLOWED_ORIGINS.includes(origin)) {
+  if (!isOriginAllowed(origin)) {
 	return new NextResponse(null, { status: 403, headers: corsHeaders(origin) });
   }
-
   return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
 }
 
 async function verifyTurnstile(token: string, ip?: string) {
-  if (!TURNSTILE_SECRET_KEY) return { ok: false, error: "TURNSTILE_SECRET_KEY is missing" };
-  if (!token) return { ok: false, error: "Missing turnstile token" };
+  if (!TURNSTILE_SECRET_KEY) return { ok: false as const, error: "TURNSTILE_SECRET_KEY is missing" };
+  if (!token) return { ok: false as const, error: "Missing turnstile token" };
 
   const form = new URLSearchParams();
   form.set("secret", TURNSTILE_SECRET_KEY);
@@ -106,8 +170,8 @@ async function verifyTurnstile(token: string, ip?: string) {
   });
 
   const j = (await r.json().catch(() => null)) as any;
-  if (!j?.success) return { ok: false, error: "Turnstile failed", details: j };
-  return { ok: true };
+  if (!j?.success) return { ok: false as const, error: "Turnstile failed", details: j };
+  return { ok: true as const };
 }
 
 async function rateLimitByIp(ip: string) {
@@ -119,17 +183,19 @@ async function rateLimitByIp(ip: string) {
 	.eq("ip", ip)
 	.gte("created_at", cutoffIso);
 
-  // если таблицы нет/ошибка — не блокируем
-  if (error) return { ok: true, warn: error.message || "rate limit check failed" };
+  if (error) {
+	console.error("[rateLimitByIp] supabase error:", error);
+	return { ok: true as const, warn: error.message };
+  }
 
   const c = count ?? 0;
-  if (c >= RATE_LIMIT_MAX) return { ok: false, error: "Too many requests. Try later." };
-  return { ok: true };
+  if (c >= RATE_LIMIT_MAX) return { ok: false as const, error: "Too many requests. Try later." };
+  return { ok: true as const };
 }
 
 async function telegramSendMessage(html: string) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-	return { ok: false, error: "Telegram env is missing" };
+	return { ok: false as const, error: "Telegram env is missing" };
   }
 
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -144,38 +210,52 @@ async function telegramSendMessage(html: string) {
 	}),
   });
 
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok || !j?.ok) return { ok: false, error: j?.description || `HTTP ${res.status}` };
-  return { ok: true };
+  const j = await res.json().catch(() => ({} as any));
+  if (!res.ok || !j?.ok) return { ok: false as const, error: j?.description || `HTTP ${res.status}` };
+  return { ok: true as const };
 }
 
-async function telegramSendDocument(file: File, captionHtml: string) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-	return { ok: false, error: "Telegram env is missing" };
+async function tryUpdateLeadRequestFileFields(leadId: string, first: any, filesCount: number) {
+  // пробуем разные названия колонок, чтобы не зависеть от схемы (file_type vs file_mime)
+  const payloadVariants: any[] = [
+	{
+	  file_path: first?.path ?? null,
+	  file_name: first?.name ?? null,
+	  file_mime: first?.type ?? null,
+	  file_size: first?.size ?? null,
+	  bucket: LEADS_BUCKET,
+	  files_count: filesCount,
+	},
+	{
+	  file_path: first?.path ?? null,
+	  file_name: first?.name ?? null,
+	  file_type: first?.type ?? null,
+	  file_size: first?.size ?? null,
+	  bucket: LEADS_BUCKET,
+	  files_count: filesCount,
+	},
+	{
+	  file_name: first?.name ?? null,
+	  file_mime: first?.type ?? null,
+	  file_size: first?.size ?? null,
+	  bucket: LEADS_BUCKET,
+	  files_count: filesCount,
+	},
+  ];
+
+  for (const p of payloadVariants) {
+	const upd = await supabaseAdmin.from("lead_requests").update(p).eq("id", leadId);
+	if (!upd.error) return;
+	// если ошибка по колонке — попробуем следующий вариант
+	const msg = String(upd.error.message || "");
+	console.error("[lead_requests update file fields] error:", msg);
   }
-
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
-
-  const fd = new FormData();
-  fd.set("chat_id", TELEGRAM_CHAT_ID);
-  fd.set("caption", captionHtml);
-  fd.set("parse_mode", "HTML");
-  fd.set("document", file, file.name || "file");
-
-  const res = await fetch(url, { method: "POST", body: fd });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok || !j?.ok) return { ok: false, error: j?.description || `HTTP ${res.status}` };
-  return { ok: true };
-}
-
-function escapeHtml(s: string) {
-  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export async function POST(req: Request) {
   try {
-	// 0) origin allowlist
-	if (!originAllowed(req)) {
+	const origin = req.headers.get("origin") || "";
+	if (!isOriginAllowed(origin)) {
 	  return corsJson(req, { ok: false, error: "Origin not allowed" }, { status: 403 });
 	}
 
@@ -191,29 +271,18 @@ export async function POST(req: Request) {
 	let message = "";
 	let hp = "";
 	let token = "";
-	let file: File | null = null;
+	let files: WebFileLike[] = [];
 
 	if (isMultipart) {
 	  const fd = await req.formData();
 
 	  name = String(fd.get("name") || "").trim();
 	  email = String(fd.get("email") || "").trim();
-	  message = String(fd.get("message") || fd.get("description") || fd.get("script") || "").trim();
-
-	  // honeypot
+	  message = String(fd.get("message") || fd.get("description") || "").trim();
 	  hp = String(fd.get("company") || fd.get("website") || "").trim();
-
-	  // Turnstile token (стандартное имя поля у Cloudflare)
 	  token = String(fd.get("cf-turnstile-response") || fd.get("turnstileToken") || "").trim();
 
-	  const f = fd.get("file");
-	  if (f && typeof f !== "string") file = f as File;
-
-	  // на всякий случай: если в лендинге поле иначе названо
-	  if (!file) {
-		const f2 = fd.get("photo") || fd.get("photo-file");
-		if (f2 && typeof f2 !== "string") file = f2 as File;
-	  }
+	  files = pickMultipartFiles(fd);
 	} else {
 	  const body = await req.json().catch(() => null);
 	  name = String(body?.name || "").trim();
@@ -221,39 +290,45 @@ export async function POST(req: Request) {
 	  message = String(body?.message || body?.description || "").trim();
 	  hp = String(body?.company || body?.website || "").trim();
 	  token = String(body?.turnstileToken || body?.cfTurnstileResponse || "").trim();
+	  files = [];
 	}
 
-	// honeypot: молча “успех”, чтобы боты не понимали
+	// honeypot — “молча успешно”
 	if (hp) return corsJson(req, { ok: true });
 
-	if (!name) return corsJson(req, { ok: false, error: "Name is required" }, { status: 400 });
 	if (!email || !isValidEmail(email)) {
 	  return corsJson(req, { ok: false, error: "Valid email is required" }, { status: 400 });
 	}
-	if (!message) return corsJson(req, { ok: false, error: "Message is required" }, { status: 400 });
+	if (!message) {
+	  return corsJson(req, { ok: false, error: "Message is required" }, { status: 400 });
+	}
+	if (!name) name = "—";
 
-	// Turnstile
-	const ts = await verifyTurnstile(token, ip);
-	if (!ts.ok) {
-	  return corsJson(req, { ok: false, error: ts.error, details: ts.details || null }, { status: 403 });
+	if (files.length > MAX_FILES) {
+	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files` }, { status: 400 });
+	}
+	for (const f of files) {
+	  if (f.size > MAX_FILE_BYTES) {
+		return corsJson(
+		  req,
+		  { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB` },
+		  { status: 413 }
+		);
+	  }
 	}
 
-	// Rate limit
+	// 1) Turnstile
+	const ts = await verifyTurnstile(token, ip);
+	if (!ts.ok) {
+	  return corsJson(req, { ok: false, error: ts.error, details: (ts as any).details || null }, { status: 403 });
+	}
+
+	// 2) Rate-limit
 	const rl = await rateLimitByIp(ip);
 	if (!rl.ok) return corsJson(req, { ok: false, error: rl.error }, { status: 429 });
 
-	// File validation (optional)
-	if (file) {
-	  if (file.size > MAX_FILE_SIZE) {
-		return corsJson(req, { ok: false, error: "File too large" }, { status: 400 });
-	  }
-	  if (file.type && !ALLOWED_MIME.includes(file.type)) {
-		return corsJson(req, { ok: false, error: "Invalid file type" }, { status: 400 });
-	  }
-	}
-
-	// Log в БД (best-effort)
-	const { error: logErr } = await supabaseAdmin
+	// 3) Insert lead
+	const { data: lead, error: leadErr } = await supabaseAdmin
 	  .from("lead_requests")
 	  .insert({
 		ip,
@@ -262,28 +337,98 @@ export async function POST(req: Request) {
 		message,
 		user_agent: ua,
 		referer,
-	  });
-	
-	if (logErr) {
-	  // best-effort: не валим форму
-	  console.warn("lead_requests insert failed:", logErr.message);
+	  })
+	  .select("id, created_at")
+	  .single();
+
+	if (leadErr || !lead) {
+	  console.error("[lead insert] error:", leadErr);
+	  return corsJson(req, { ok: false, error: leadErr?.message || "DB insert failed" }, { status: 500 });
 	}
+
+	const leadId = String(lead.id);
+
+	// 3.1) Upload files (если есть)
+	const uploaded: { path: string; name: string; size: number; type: string; bucket?: string }[] = [];
+
+	for (let i = 0; i < files.length; i++) {
+	  const file = files[i];
+	  const safeName = safeFilename(file.name);
+	  const path = `${leadId}/${Date.now()}_${i + 1}_${safeName}`;
+
+	  const buf = Buffer.from(await file.arrayBuffer());
+
+	  const up = await supabaseAdmin.storage.from(LEADS_BUCKET).upload(path, buf, {
+		contentType: file.type || "application/octet-stream",
+		upsert: true,
+	  });
+
+	  if (up.error) {
+		console.error("[storage upload] error:", up.error);
+		continue;
+	  }
+
+	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
+	}
+
+	// 3.2) lead_files insert (если таблица есть)
+	if (uploaded.length > 0) {
+	  const rowsWithBucket = uploaded.map((u) => ({
+		lead_id: leadId,
+		file_path: u.path,
+		file_name: u.name,
+		file_mime: u.type || null,
+		file_size: u.size || null,
+		bucket: LEADS_BUCKET,
+	  }));
+
+	  const ins1 = await supabaseAdmin.from("lead_files").insert(rowsWithBucket as any);
+	  if (ins1.error) {
+		// возможно нет колонки bucket — попробуем без неё
+		console.error("[lead_files insert] error:", ins1.error);
+		const rowsNoBucket = uploaded.map((u) => ({
+		  lead_id: leadId,
+		  file_path: u.path,
+		  file_name: u.name,
+		  file_mime: u.type || null,
+		  file_size: u.size || null,
+		}));
+		const ins2 = await supabaseAdmin.from("lead_files").insert(rowsNoBucket as any);
+		if (ins2.error) console.error("[lead_files insert fallback] error:", ins2.error);
+	  }
+
+	  // 3.3) update lead_requests first file for compatibility
+	  await tryUpdateLeadRequestFileFields(leadId, uploaded[0], uploaded.length);
+	}
+
+	// 4) Telegram
+	const filesLine =
+	  uploaded.length > 0
+		? `\n📎 Файлы (${uploaded.length}):\n` +
+		  uploaded.map((f) => `• ${escapeHtml(f.name)} (${Math.round(f.size / 1024)} KB)`).join("\n")
+		: files.length > 0
+		? `\n⚠️ Файлы были прикреплены, но не загрузились в Storage (bucket: "${escapeHtml(LEADS_BUCKET)}").`
+		: "";
 
 	const text =
 	  `🆕 <b>Новая заявка (lead)</b>\n` +
+	  `🆔 <code>${escapeHtml(leadId)}</code>\n` +
 	  `👤 <b>${escapeHtml(name)}</b>\n` +
 	  `✉️ ${escapeHtml(email)}\n` +
 	  `🌐 IP: <code>${escapeHtml(ip)}</code>\n` +
 	  (referer ? `🔗 ${escapeHtml(referer)}\n` : "") +
-	  `\n📝 ${escapeHtml(message)}`;
+	  `\n📝 ${escapeHtml(message)}` +
+	  filesLine;
 
-	const tg = file ? await telegramSendDocument(file, text) : await telegramSendMessage(text);
+	const tg = await telegramSendMessage(text);
 	if (!tg.ok) {
-	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed" }, { status: 500 });
+	  console.error("[telegram] error:", tg.error);
+	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId }, { status: 500 });
 	}
 
-	return corsJson(req, { ok: true });
+	return corsJson(req, { ok: true, leadId, files: uploaded });
   } catch (e: any) {
+	console.error("[/api/request] error:", e);
 	return corsJson(req, { ok: false, error: e?.message || "Server error" }, { status: 500 });
   }
 }

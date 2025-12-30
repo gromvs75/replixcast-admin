@@ -70,6 +70,14 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
     router.refresh();
   };
 
+  // ---- nav helpers ----
+  const isActive = (href: string) => pathname === href || pathname.startsWith(href + "/");
+
+  const navClass = (href: string) =>
+    `text-sm font-medium hover:underline ${
+      isActive(href) ? "text-slate-900" : "text-slate-600"
+    }`;
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <header className="sticky top-0 z-40 border-b bg-white/90 backdrop-blur">
@@ -79,9 +87,17 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
               ReplixCast
             </div>
             <span className="text-slate-300">/</span>
-            <Link href="/admin/orders" className="text-sm font-medium hover:underline">
-              Заявки
-            </Link>
+
+            {/* ✅ Меню */}
+            <nav className="flex items-center gap-4">
+              <Link href="/admin/orders" className={navClass("/admin/orders")}>
+                Заявки
+              </Link>
+
+              <Link href="/admin/leads" className={navClass("/admin/leads")}>
+                Лиды
+              </Link>
+            </nav>
           </div>
 
           <button
