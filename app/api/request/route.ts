@@ -10,7 +10,6 @@ const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error("Missing Supabase env: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
-
 const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -21,6 +20,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const LEADS_BUCKET = process.env.LEADS_BUCKET || "leads";
 
+// ALLOWED_ORIGINS=https://replixcast.de,https://www.replixcast.de,http://localhost:3000
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -55,6 +55,7 @@ function safeFilename(name: string) {
   return n.replace(/[^\w.\-]+/g, "_").slice(0, 180);
 }
 
+// File-like
 type WebFileLike = {
   name: string;
   type: string;
@@ -76,6 +77,7 @@ function asWebFileLike(v: any): WebFileLike | null {
 // Забираем до 3 файлов: поддерживаем files / files[] / file / upload и т.п.
 function pickMultipartFiles(fd: FormData): WebFileLike[] {
   const out: WebFileLike[] = [];
+
   const keys = ["files", "files[]", "file", "file[]", "upload", "uploads", "photo", "image", "avatar"];
 
   for (const k of keys) {
@@ -116,7 +118,7 @@ function corsHeaders(origin: string) {
 
   return {
 	"Access-Control-Allow-Origin": allowOrigin || "null",
-	"Access-Control-Allow-Methods": "POST, OPTIONS",
+	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 	"Access-Control-Allow-Headers": "Content-Type",
 	"Access-Control-Max-Age": "86400",
 	Vary: "Origin",
@@ -137,6 +139,15 @@ export async function OPTIONS(req: Request) {
 	return new NextResponse(null, { status: 403, headers: corsHeaders(origin) });
   }
   return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
+}
+
+// ✅ Health check (чтобы в браузере не ловить 405)
+export async function GET(req: Request) {
+  const origin = req.headers.get("origin") || "";
+  if (!isOriginAllowed(origin)) {
+	return corsJson(req, { ok: false, error: "Origin not allowed" }, { status: 403 });
+  }
+  return corsJson(req, { ok: true, route: "/api/request", bucket: LEADS_BUCKET, ts: new Date().toISOString() });
 }
 
 async function verifyTurnstile(token: string, ip?: string) {
@@ -200,7 +211,44 @@ async function telegramSendMessage(html: string) {
   return { ok: true as const };
 }
 
+async function updateLeadRequestFirstFile(leadId: string, first: any, filesCount: number) {
+  // у тебя в lead_requests колонка называется file_type (не file_mime)
+  const payloadVariants: any[] = [
+	{
+	  file_path: first?.path ?? null,
+	  file_name: first?.name ?? null,
+	  file_type: first?.type ?? null,
+	  file_size: first?.size ?? null,
+	},
+	{
+	  file_path: first?.path ?? null,
+	  file_name: first?.name ?? null,
+	  file_size: first?.size ?? null,
+	},
+  ];
+
+  for (const p of payloadVariants) {
+	const upd = await supabaseAdmin.from("lead_requests").update(p).eq("id", leadId);
+	if (!upd.error) return;
+	console.error("[lead_requests update file_*] error:", upd.error.message);
+  }
+}
+
 export async function POST(req: Request) {
+  const url = new URL(req.url);
+  const debug = url.searchParams.get("debug") === "1";
+
+  const dbg: any = {
+	debug,
+	contentType: req.headers.get("content-type") || "",
+	bucket: LEADS_BUCKET,
+	formKeys: [] as string[],
+	filesFound: [] as any[],
+	uploadErrors: [] as any[],
+	insertErrors: [] as any[],
+	bucketCheck: null as any,
+  };
+
   try {
 	const origin = req.headers.get("origin") || "";
 	if (!isOriginAllowed(origin)) {
@@ -223,6 +271,15 @@ export async function POST(req: Request) {
 
 	if (isMultipart) {
 	  const fd = await req.formData();
+	  dbg.formKeys = Array.from(new Set(Array.from(fd.keys())));
+
+	  // покажем, какие “файлы” реально пришли
+	  if (debug) {
+		for (const [k, v] of fd.entries()) {
+		  const f = asWebFileLike(v);
+		  if (f) dbg.filesFound.push({ key: k, name: f.name, size: f.size, type: f.type });
+		}
+	  }
 
 	  name = String(fd.get("name") || "").trim();
 	  email = String(fd.get("email") || "").trim();
@@ -242,61 +299,61 @@ export async function POST(req: Request) {
 	}
 
 	// honeypot — “молча успешно”
-	if (hp) return corsJson(req, { ok: true });
+	if (hp) return corsJson(req, { ok: true, ...(debug ? { debug: dbg, note: "honeypot" } : {}) });
 
 	if (!email || !isValidEmail(email)) {
-	  return corsJson(req, { ok: false, error: "Valid email is required" }, { status: 400 });
+	  return corsJson(req, { ok: false, error: "Valid email is required", ...(debug ? { debug: dbg } : {}) }, { status: 400 });
 	}
 	if (!message) {
-	  return corsJson(req, { ok: false, error: "Message is required" }, { status: 400 });
+	  return corsJson(req, { ok: false, error: "Message is required", ...(debug ? { debug: dbg } : {}) }, { status: 400 });
 	}
 	if (!name) name = "—";
 
 	if (files.length > MAX_FILES) {
-	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files` }, { status: 400 });
+	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files`, ...(debug ? { debug: dbg } : {}) }, { status: 400 });
 	}
-
 	for (const f of files) {
 	  if (f.size > MAX_FILE_BYTES) {
-		return corsJson(req, { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB` }, { status: 413 });
+		return corsJson(
+		  req,
+		  { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB`, ...(debug ? { debug: dbg } : {}) },
+		  { status: 413 }
+		);
 	  }
 	}
-
-	console.log("[/api/request] files received:", files.map(f => ({ name: f.name, size: f.size, type: f.type })));
 
 	// 1) Turnstile
 	const ts = await verifyTurnstile(token, ip);
 	if (!ts.ok) {
-	  return corsJson(req, { ok: false, error: ts.error, details: (ts as any).details || null }, { status: 403 });
+	  return corsJson(req, { ok: false, error: ts.error, details: (ts as any).details || null, ...(debug ? { debug: dbg } : {}) }, { status: 403 });
 	}
 
 	// 2) Rate-limit
 	const rl = await rateLimitByIp(ip);
-	if (!rl.ok) return corsJson(req, { ok: false, error: rl.error }, { status: 429 });
+	if (!rl.ok) return corsJson(req, { ok: false, error: rl.error, ...(debug ? { debug: dbg } : {}) }, { status: 429 });
 
 	// 3) Insert lead
 	const { data: lead, error: leadErr } = await supabaseAdmin
 	  .from("lead_requests")
-	  .insert({
-		ip,
-		name,
-		email,
-		message,
-		user_agent: ua,
-		referer,
-	  })
+	  .insert({ ip, name, email, message, user_agent: ua, referer })
 	  .select("id, created_at")
 	  .single();
 
 	if (leadErr || !lead) {
 	  console.error("[lead insert] error:", leadErr);
-	  return corsJson(req, { ok: false, error: leadErr?.message || "DB insert failed" }, { status: 500 });
+	  return corsJson(req, { ok: false, error: leadErr?.message || "DB insert failed", ...(debug ? { debug: dbg } : {}) }, { status: 500 });
 	}
 
 	const leadId = String(lead.id);
 
+	// 3.05) проверим bucket (в debug)
+	if (debug && (supabaseAdmin.storage as any).getBucket) {
+	  const bc = await (supabaseAdmin.storage as any).getBucket(LEADS_BUCKET);
+	  dbg.bucketCheck = bc?.error ? { ok: false, error: bc.error.message } : { ok: true, data: bc.data };
+	}
+
 	// 3.1) Upload files
-	const uploaded: { path: string; name: string; size: number; type: string }[] = [];
+	const uploaded: { path: string; name: string; size: number; type: string; bucket: string }[] = [];
 
 	for (let i = 0; i < files.length; i++) {
 	  const file = files[i];
@@ -311,16 +368,25 @@ export async function POST(req: Request) {
 	  });
 
 	  if (up.error) {
-		console.error("[storage upload] error:", up.error);
+		const errMsg = up.error.message || "upload error";
+		console.error("[storage upload] error:", errMsg);
+		dbg.uploadErrors.push({ file: safeName, message: errMsg });
 		continue;
 	  }
 
-	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "" });
+	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
 	}
 
-	console.log("[/api/request] uploaded:", uploaded);
+	// ✅ Если файлы прикрепили, но ни один не загрузился — возвращаем ошибку (чтобы не было “успеха без файла”)
+	if (files.length > 0 && uploaded.length === 0) {
+	  return corsJson(
+		req,
+		{ ok: false, error: "Files were attached but upload to Storage failed. Check bucket/keys/policies.", leadId, ...(debug ? { debug: dbg } : {}) },
+		{ status: 500 }
+	  );
+	}
 
-	// 3.2) Insert lead_files + update lead_requests (только реальные колонки!)
+	// 3.2) lead_files insert
 	if (uploaded.length > 0) {
 	  const rows = uploaded.map((u) => ({
 		lead_id: leadId,
@@ -332,21 +398,13 @@ export async function POST(req: Request) {
 	  }));
 
 	  const ins = await supabaseAdmin.from("lead_files").insert(rows as any);
-	  if (ins.error) console.error("[lead_files insert] error:", ins.error);
+	  if (ins.error) {
+		console.error("[lead_files insert] error:", ins.error.message);
+		dbg.insertErrors.push({ table: "lead_files", message: ins.error.message });
+	  }
 
-	  // совместимость: в lead_requests сохраняем ПЕРВЫЙ файл
-	  const first = uploaded[0];
-	  const upd = await supabaseAdmin
-		.from("lead_requests")
-		.update({
-		  file_path: first.path,
-		  file_name: first.name,
-		  file_type: first.type || null,
-		  file_size: first.size || null,
-		})
-		.eq("id", leadId);
-
-	  if (upd.error) console.error("[lead_requests update file_*] error:", upd.error);
+	  // 3.3) update lead_requests (first file)
+	  await updateLeadRequestFirstFile(leadId, uploaded[0], uploaded.length);
 	}
 
 	// 4) Telegram
@@ -354,9 +412,7 @@ export async function POST(req: Request) {
 	  uploaded.length > 0
 		? `\n📎 Файлы (${uploaded.length}):\n` +
 		  uploaded.map((f) => `• ${escapeHtml(f.name)} (${Math.round(f.size / 1024)} KB)`).join("\n")
-		: files.length > 0
-		  ? `\n⚠️ Файлы были прикреплены, но не загрузились в Storage (bucket: "${escapeHtml(LEADS_BUCKET)}").`
-		  : "";
+		: "";
 
 	const text =
 	  `🆕 <b>Новая заявка (lead)</b>\n` +
@@ -371,12 +427,12 @@ export async function POST(req: Request) {
 	const tg = await telegramSendMessage(text);
 	if (!tg.ok) {
 	  console.error("[telegram] error:", tg.error);
-	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId }, { status: 500 });
+	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId, ...(debug ? { debug: dbg } : {}) }, { status: 500 });
 	}
 
-	return corsJson(req, { ok: true, leadId, files: uploaded });
+	return corsJson(req, { ok: true, leadId, files: uploaded, ...(debug ? { debug: dbg } : {}) });
   } catch (e: any) {
 	console.error("[/api/request] error:", e);
-	return corsJson(req, { ok: false, error: e?.message || "Server error" }, { status: 500 });
+	return corsJson(req, { ok: false, error: e?.message || "Server error", ...(debug ? { debug: dbg } : {}) }, { status: 500 });
   }
 }
