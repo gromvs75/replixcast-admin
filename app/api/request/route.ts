@@ -10,6 +10,7 @@ const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 if (!supabaseUrl || !serviceRoleKey) {
   throw new Error("Missing Supabase env: NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
+
 const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -20,7 +21,6 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const LEADS_BUCKET = process.env.LEADS_BUCKET || "leads";
 
-// ALLOWED_ORIGINS=https://replixcast.de,https://www.replixcast.de,http://localhost:3000
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -47,10 +47,7 @@ function getIp(req: Request) {
 }
 
 function escapeHtml(s: string) {
-  return (s || "")
-	.replace(/&/g, "&amp;")
-	.replace(/</g, "&lt;")
-	.replace(/>/g, "&gt;");
+  return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function safeFilename(name: string) {
@@ -58,7 +55,6 @@ function safeFilename(name: string) {
   return n.replace(/[^\w.\-]+/g, "_").slice(0, 180);
 }
 
-// File-like
 type WebFileLike = {
   name: string;
   type: string;
@@ -77,9 +73,9 @@ function asWebFileLike(v: any): WebFileLike | null {
   return { name, type, size, arrayBuffer: v.arrayBuffer.bind(v) };
 }
 
+// Забираем до 3 файлов: поддерживаем files / files[] / file / upload и т.п.
 function pickMultipartFiles(fd: FormData): WebFileLike[] {
   const out: WebFileLike[] = [];
-
   const keys = ["files", "files[]", "file", "file[]", "upload", "uploads", "photo", "image", "avatar"];
 
   for (const k of keys) {
@@ -205,8 +201,6 @@ async function telegramSendMessage(html: string) {
 }
 
 export async function POST(req: Request) {
-  const errors: string[] = [];
-
   try {
 	const origin = req.headers.get("origin") || "";
 	if (!isOriginAllowed(origin)) {
@@ -261,15 +255,14 @@ export async function POST(req: Request) {
 	if (files.length > MAX_FILES) {
 	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files` }, { status: 400 });
 	}
+
 	for (const f of files) {
 	  if (f.size > MAX_FILE_BYTES) {
-		return corsJson(
-		  req,
-		  { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB` },
-		  { status: 413 }
-		);
+		return corsJson(req, { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB` }, { status: 413 });
 	  }
 	}
+
+	console.log("[/api/request] files received:", files.map(f => ({ name: f.name, size: f.size, type: f.type })));
 
 	// 1) Turnstile
 	const ts = await verifyTurnstile(token, ip);
@@ -292,7 +285,7 @@ export async function POST(req: Request) {
 		user_agent: ua,
 		referer,
 	  })
-	  .select("id")
+	  .select("id, created_at")
 	  .single();
 
 	if (leadErr || !lead) {
@@ -303,35 +296,31 @@ export async function POST(req: Request) {
 	const leadId = String(lead.id);
 
 	// 3.1) Upload files
-	const receivedFiles = files.map((f) => ({ name: f.name, size: f.size, type: f.type || "" }));
-	const uploaded: { path: string; name: string; size: number; type: string; bucket: string }[] = [];
+	const uploaded: { path: string; name: string; size: number; type: string }[] = [];
 
 	for (let i = 0; i < files.length; i++) {
 	  const file = files[i];
 	  const safeName = safeFilename(file.name);
 	  const path = `${leadId}/${Date.now()}_${i + 1}_${safeName}`;
 
-	  try {
-		const buf = Buffer.from(await file.arrayBuffer());
-		const up = await supabaseAdmin.storage.from(LEADS_BUCKET).upload(path, buf, {
-		  contentType: file.type || "application/octet-stream",
-		  upsert: true,
-		});
+	  const buf = Buffer.from(await file.arrayBuffer());
 
-		if (up.error) {
-		  console.error("[storage upload] error:", up.error);
-		  errors.push(`storage.upload(${safeName}): ${up.error.message}`);
-		  continue;
-		}
+	  const up = await supabaseAdmin.storage.from(LEADS_BUCKET).upload(path, buf, {
+		contentType: file.type || "application/octet-stream",
+		upsert: true,
+	  });
 
-		uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
-	  } catch (e: any) {
-		console.error("[storage upload] exception:", e);
-		errors.push(`storage.upload(${safeName}): ${e?.message || "unknown error"}`);
+	  if (up.error) {
+		console.error("[storage upload] error:", up.error);
+		continue;
 	  }
+
+	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "" });
 	}
 
-	// 3.2) Insert lead_files + update lead_requests first file
+	console.log("[/api/request] uploaded:", uploaded);
+
+	// 3.2) Insert lead_files + update lead_requests (только реальные колонки!)
 	if (uploaded.length > 0) {
 	  const rows = uploaded.map((u) => ({
 		lead_id: leadId,
@@ -339,16 +328,13 @@ export async function POST(req: Request) {
 		file_name: u.name,
 		file_mime: u.type || null,
 		file_size: u.size || null,
-		bucket: u.bucket,
+		bucket: LEADS_BUCKET,
 	  }));
 
 	  const ins = await supabaseAdmin.from("lead_files").insert(rows as any);
-	  if (ins.error) {
-		console.error("[lead_files insert] error:", ins.error);
-		errors.push(`lead_files.insert: ${ins.error.message}`);
-	  }
+	  if (ins.error) console.error("[lead_files insert] error:", ins.error);
 
-	  // lead_requests (твоя схема: file_type)
+	  // совместимость: в lead_requests сохраняем ПЕРВЫЙ файл
 	  const first = uploaded[0];
 	  const upd = await supabaseAdmin
 		.from("lead_requests")
@@ -360,10 +346,7 @@ export async function POST(req: Request) {
 		})
 		.eq("id", leadId);
 
-	  if (upd.error) {
-		console.error("[lead_requests update file_*] error:", upd.error);
-		errors.push(`lead_requests.update: ${upd.error.message}`);
-	  }
+	  if (upd.error) console.error("[lead_requests update file_*] error:", upd.error);
 	}
 
 	// 4) Telegram
@@ -388,17 +371,10 @@ export async function POST(req: Request) {
 	const tg = await telegramSendMessage(text);
 	if (!tg.ok) {
 	  console.error("[telegram] error:", tg.error);
-	  // лид уже создан — не ломаем клиенту, просто вернём предупреждение
-	  errors.push(`telegram: ${tg.error}`);
+	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId }, { status: 500 });
 	}
 
-	return corsJson(req, {
-	  ok: true,
-	  leadId,
-	  receivedFiles,
-	  uploaded,
-	  errors,
-	});
+	return corsJson(req, { ok: true, leadId, files: uploaded });
   } catch (e: any) {
 	console.error("[/api/request] error:", e);
 	return corsJson(req, { ok: false, error: e?.message || "Server error" }, { status: 500 });
