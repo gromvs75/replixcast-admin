@@ -39,17 +39,14 @@ const RATE_LIMIT_MAX = 5;
 function isValidEmail(v: string) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 }
-
 function getIp(req: Request) {
   const fwd = req.headers.get("x-forwarded-for") || "";
   const ip = fwd.split(",")[0]?.trim();
   return ip || req.headers.get("x-real-ip") || "unknown";
 }
-
 function escapeHtml(s: string) {
   return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
-
 function safeFilename(name: string) {
   const n = (name || "file").trim();
   return n.replace(/[^\w.\-]+/g, "_").slice(0, 180);
@@ -74,10 +71,9 @@ function asWebFileLike(v: any): WebFileLike | null {
   return { name, type, size, arrayBuffer: v.arrayBuffer.bind(v) };
 }
 
-// Забираем до 3 файлов: поддерживаем files / files[] / file / upload и т.п.
+// Забираем до 3 файлов: files / files[] / file / upload и т.п.
 function pickMultipartFiles(fd: FormData): WebFileLike[] {
   const out: WebFileLike[] = [];
-
   const keys = ["files", "files[]", "file", "file[]", "upload", "uploads", "photo", "image", "avatar"];
 
   for (const k of keys) {
@@ -105,7 +101,6 @@ function isOriginAllowed(origin: string) {
   if (ALLOWED_ORIGINS.length === 0) return true;
   return ALLOWED_ORIGINS.includes(origin);
 }
-
 function corsHeaders(origin: string) {
   const allowOrigin =
 	!origin
@@ -118,13 +113,12 @@ function corsHeaders(origin: string) {
 
   return {
 	"Access-Control-Allow-Origin": allowOrigin || "null",
-	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+	"Access-Control-Allow-Methods": "POST, OPTIONS",
 	"Access-Control-Allow-Headers": "Content-Type",
 	"Access-Control-Max-Age": "86400",
 	Vary: "Origin",
   };
 }
-
 function corsJson(req: Request, body: any, init?: { status?: number }) {
   const origin = req.headers.get("origin") || "";
   return NextResponse.json(body, {
@@ -132,22 +126,12 @@ function corsJson(req: Request, body: any, init?: { status?: number }) {
 	headers: corsHeaders(origin),
   });
 }
-
 export async function OPTIONS(req: Request) {
   const origin = req.headers.get("origin") || "";
   if (!isOriginAllowed(origin)) {
 	return new NextResponse(null, { status: 403, headers: corsHeaders(origin) });
   }
   return new NextResponse(null, { status: 204, headers: corsHeaders(origin) });
-}
-
-// ✅ Health check (чтобы в браузере не ловить 405)
-export async function GET(req: Request) {
-  const origin = req.headers.get("origin") || "";
-  if (!isOriginAllowed(origin)) {
-	return corsJson(req, { ok: false, error: "Origin not allowed" }, { status: 403 });
-  }
-  return corsJson(req, { ok: true, route: "/api/request", bucket: LEADS_BUCKET, ts: new Date().toISOString() });
 }
 
 async function verifyTurnstile(token: string, ip?: string) {
@@ -211,48 +195,28 @@ async function telegramSendMessage(html: string) {
   return { ok: true as const };
 }
 
-async function updateLeadRequestFirstFile(leadId: string, first: any, filesCount: number) {
-  // у тебя в lead_requests колонка называется file_type (не file_mime)
-  const payloadVariants: any[] = [
-	{
-	  file_path: first?.path ?? null,
-	  file_name: first?.name ?? null,
-	  file_type: first?.type ?? null,
-	  file_size: first?.size ?? null,
-	},
-	{
-	  file_path: first?.path ?? null,
-	  file_name: first?.name ?? null,
-	  file_size: first?.size ?? null,
-	},
-  ];
-
-  for (const p of payloadVariants) {
-	const upd = await supabaseAdmin.from("lead_requests").update(p).eq("id", leadId);
-	if (!upd.error) return;
-	console.error("[lead_requests update file_*] error:", upd.error.message);
-  }
-}
-
 export async function POST(req: Request) {
-  const url = new URL(req.url);
-  const debug = url.searchParams.get("debug") === "1";
+  const debugMode = new URL(req.url).searchParams.get("debug") === "1";
+  const build =
+	process.env.VERCEL_GIT_COMMIT_SHA ||
+	process.env.VERCEL_GIT_COMMIT_REF ||
+	process.env.VERCEL_ENV ||
+	"unknown";
 
-  const dbg: any = {
-	debug,
-	contentType: req.headers.get("content-type") || "",
+  const debug: any = {
+	build,
 	bucket: LEADS_BUCKET,
-	formKeys: [] as string[],
-	filesFound: [] as any[],
-	uploadErrors: [] as any[],
-	insertErrors: [] as any[],
-	bucketCheck: null as any,
+	contentType: req.headers.get("content-type") || "",
+	filesFound: [],
+	uploadErrors: [],
+	leadFilesInsertError: null,
+	bucketCheck: null,
   };
 
   try {
 	const origin = req.headers.get("origin") || "";
 	if (!isOriginAllowed(origin)) {
-	  return corsJson(req, { ok: false, error: "Origin not allowed" }, { status: 403 });
+	  return corsJson(req, { ok: false, error: "Origin not allowed", debug: debugMode ? debug : undefined }, { status: 403 });
 	}
 
 	const ip = getIp(req);
@@ -265,26 +229,15 @@ export async function POST(req: Request) {
 	let name = "";
 	let email = "";
 	let message = "";
-	let hp = "";
 	let token = "";
 	let files: WebFileLike[] = [];
 
 	if (isMultipart) {
 	  const fd = await req.formData();
-	  dbg.formKeys = Array.from(new Set(Array.from(fd.keys())));
-
-	  // покажем, какие “файлы” реально пришли
-	  if (debug) {
-		for (const [k, v] of fd.entries()) {
-		  const f = asWebFileLike(v);
-		  if (f) dbg.filesFound.push({ key: k, name: f.name, size: f.size, type: f.type });
-		}
-	  }
 
 	  name = String(fd.get("name") || "").trim();
 	  email = String(fd.get("email") || "").trim();
 	  message = String(fd.get("message") || fd.get("description") || "").trim();
-	  hp = String(fd.get("company") || fd.get("website") || "").trim();
 	  token = String(fd.get("cf-turnstile-response") || fd.get("turnstileToken") || "").trim();
 
 	  files = pickMultipartFiles(fd);
@@ -293,100 +246,105 @@ export async function POST(req: Request) {
 	  name = String(body?.name || "").trim();
 	  email = String(body?.email || "").trim();
 	  message = String(body?.message || body?.description || "").trim();
-	  hp = String(body?.company || body?.website || "").trim();
 	  token = String(body?.turnstileToken || body?.cfTurnstileResponse || "").trim();
 	  files = [];
 	}
 
-	// honeypot — “молча успешно”
-	if (hp) return corsJson(req, { ok: true, ...(debug ? { debug: dbg, note: "honeypot" } : {}) });
+	debug.filesFound = files.map((f) => ({ name: f.name, size: f.size, type: f.type }));
 
 	if (!email || !isValidEmail(email)) {
-	  return corsJson(req, { ok: false, error: "Valid email is required", ...(debug ? { debug: dbg } : {}) }, { status: 400 });
+	  return corsJson(req, { ok: false, error: "Valid email is required", debug: debugMode ? debug : undefined }, { status: 400 });
 	}
 	if (!message) {
-	  return corsJson(req, { ok: false, error: "Message is required", ...(debug ? { debug: dbg } : {}) }, { status: 400 });
+	  return corsJson(req, { ok: false, error: "Message is required", debug: debugMode ? debug : undefined }, { status: 400 });
 	}
 	if (!name) name = "—";
 
 	if (files.length > MAX_FILES) {
-	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files`, ...(debug ? { debug: dbg } : {}) }, { status: 400 });
+	  return corsJson(req, { ok: false, error: `Max ${MAX_FILES} files`, debug: debugMode ? debug : undefined }, { status: 400 });
 	}
 	for (const f of files) {
 	  if (f.size > MAX_FILE_BYTES) {
 		return corsJson(
 		  req,
-		  { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB`, ...(debug ? { debug: dbg } : {}) },
+		  { ok: false, error: `File "${f.name}" is too large. Max ${MAX_FILE_MB}MB`, debug: debugMode ? debug : undefined },
 		  { status: 413 }
 		);
 	  }
 	}
 
-	// 1) Turnstile
+	// Turnstile
 	const ts = await verifyTurnstile(token, ip);
 	if (!ts.ok) {
-	  return corsJson(req, { ok: false, error: ts.error, details: (ts as any).details || null, ...(debug ? { debug: dbg } : {}) }, { status: 403 });
+	  return corsJson(req, { ok: false, error: ts.error, details: (ts as any).details || null, debug: debugMode ? debug : undefined }, { status: 403 });
 	}
 
-	// 2) Rate-limit
+	// Rate-limit
 	const rl = await rateLimitByIp(ip);
-	if (!rl.ok) return corsJson(req, { ok: false, error: rl.error, ...(debug ? { debug: dbg } : {}) }, { status: 429 });
+	if (!rl.ok) return corsJson(req, { ok: false, error: rl.error, debug: debugMode ? debug : undefined }, { status: 429 });
 
-	// 3) Insert lead
+	// Bucket check (debug only)
+	if (debugMode) {
+	  try {
+		const { data, error } = await supabaseAdmin.storage.listBuckets();
+		debug.bucketCheck = {
+		  ok: !error,
+		  error: error ? String(error.message || error) : null,
+		  exists: Array.isArray(data) ? data.some((b: any) => b?.name === LEADS_BUCKET) : null,
+		};
+	  } catch (e: any) {
+		debug.bucketCheck = { ok: false, error: e?.message || String(e), exists: null };
+	  }
+	}
+
+	// Insert lead
 	const { data: lead, error: leadErr } = await supabaseAdmin
 	  .from("lead_requests")
-	  .insert({ ip, name, email, message, user_agent: ua, referer })
+	  .insert({
+		ip,
+		name,
+		email,
+		message,
+		user_agent: ua,
+		referer,
+	  })
 	  .select("id, created_at")
 	  .single();
 
 	if (leadErr || !lead) {
 	  console.error("[lead insert] error:", leadErr);
-	  return corsJson(req, { ok: false, error: leadErr?.message || "DB insert failed", ...(debug ? { debug: dbg } : {}) }, { status: 500 });
+	  return corsJson(req, { ok: false, error: leadErr?.message || "DB insert failed", debug: debugMode ? debug : undefined }, { status: 500 });
 	}
 
 	const leadId = String(lead.id);
 
-	// 3.05) проверим bucket (в debug)
-	if (debug && (supabaseAdmin.storage as any).getBucket) {
-	  const bc = await (supabaseAdmin.storage as any).getBucket(LEADS_BUCKET);
-	  dbg.bucketCheck = bc?.error ? { ok: false, error: bc.error.message } : { ok: true, data: bc.data };
-	}
-
-	// 3.1) Upload files
+	// Upload files
 	const uploaded: { path: string; name: string; size: number; type: string; bucket: string }[] = [];
-
 	for (let i = 0; i < files.length; i++) {
 	  const file = files[i];
 	  const safeName = safeFilename(file.name);
 	  const path = `${leadId}/${Date.now()}_${i + 1}_${safeName}`;
 
-	  const buf = Buffer.from(await file.arrayBuffer());
+	  try {
+		const buf = Buffer.from(await file.arrayBuffer());
 
-	  const up = await supabaseAdmin.storage.from(LEADS_BUCKET).upload(path, buf, {
-		contentType: file.type || "application/octet-stream",
-		upsert: true,
-	  });
+		const up = await supabaseAdmin.storage.from(LEADS_BUCKET).upload(path, buf, {
+		  contentType: file.type || "application/octet-stream",
+		  upsert: true,
+		});
 
-	  if (up.error) {
-		const errMsg = up.error.message || "upload error";
-		console.error("[storage upload] error:", errMsg);
-		dbg.uploadErrors.push({ file: safeName, message: errMsg });
-		continue;
+		if (up.error) {
+		  debug.uploadErrors.push({ name: file.name, error: String(up.error.message || up.error) });
+		  continue;
+		}
+
+		uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
+	  } catch (e: any) {
+		debug.uploadErrors.push({ name: file.name, error: e?.message || String(e) });
 	  }
-
-	  uploaded.push({ path, name: safeName, size: file.size, type: file.type || "", bucket: LEADS_BUCKET });
 	}
 
-	// ✅ Если файлы прикрепили, но ни один не загрузился — возвращаем ошибку (чтобы не было “успеха без файла”)
-	if (files.length > 0 && uploaded.length === 0) {
-	  return corsJson(
-		req,
-		{ ok: false, error: "Files were attached but upload to Storage failed. Check bucket/keys/policies.", leadId, ...(debug ? { debug: dbg } : {}) },
-		{ status: 500 }
-	  );
-	}
-
-	// 3.2) lead_files insert
+	// Insert lead_files
 	if (uploaded.length > 0) {
 	  const rows = uploaded.map((u) => ({
 		lead_id: leadId,
@@ -394,27 +352,39 @@ export async function POST(req: Request) {
 		file_name: u.name,
 		file_mime: u.type || null,
 		file_size: u.size || null,
-		bucket: LEADS_BUCKET,
+		bucket: u.bucket,
 	  }));
 
 	  const ins = await supabaseAdmin.from("lead_files").insert(rows as any);
 	  if (ins.error) {
-		console.error("[lead_files insert] error:", ins.error.message);
-		dbg.insertErrors.push({ table: "lead_files", message: ins.error.message });
+		debug.leadFilesInsertError = String(ins.error.message || ins.error);
+		console.error("[lead_files insert] error:", ins.error);
 	  }
 
-	  // 3.3) update lead_requests (first file)
-	  await updateLeadRequestFirstFile(leadId, uploaded[0], uploaded.length);
+	  // Update lead_requests first-file fields (по твоей схеме)
+	  const upd = await supabaseAdmin
+		.from("lead_requests")
+		.update({
+		  file_path: uploaded[0].path,
+		  file_name: uploaded[0].name,
+		  file_type: uploaded[0].type || null,
+		  file_size: uploaded[0].size || null,
+		})
+		.eq("id", leadId);
+
+	  if (upd.error) console.error("[lead_requests update file_*] error:", upd.error);
 	}
 
-	// 4) Telegram
+	// Telegram (со списком файлов)
 	const filesLine =
 	  uploaded.length > 0
 		? `\n📎 Файлы (${uploaded.length}):\n` +
 		  uploaded.map((f) => `• ${escapeHtml(f.name)} (${Math.round(f.size / 1024)} KB)`).join("\n")
-		: "";
+		: files.length > 0
+		  ? `\n⚠️ Файлы были прикреплены, но не загрузились в Storage (bucket: "${escapeHtml(LEADS_BUCKET)}").`
+		  : "";
 
-	const text =
+	const textMsg =
 	  `🆕 <b>Новая заявка (lead)</b>\n` +
 	  `🆔 <code>${escapeHtml(leadId)}</code>\n` +
 	  `👤 <b>${escapeHtml(name)}</b>\n` +
@@ -424,15 +394,16 @@ export async function POST(req: Request) {
 	  `\n📝 ${escapeHtml(message)}` +
 	  filesLine;
 
-	const tg = await telegramSendMessage(text);
+	const tg = await telegramSendMessage(textMsg);
 	if (!tg.ok) {
 	  console.error("[telegram] error:", tg.error);
-	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId, ...(debug ? { debug: dbg } : {}) }, { status: 500 });
+	  return corsJson(req, { ok: false, error: tg.error || "Telegram failed", leadId, debug: debugMode ? debug : undefined }, { status: 500 });
 	}
 
-	return corsJson(req, { ok: true, leadId, files: uploaded, ...(debug ? { debug: dbg } : {}) });
+	return corsJson(req, { ok: true, leadId, files: uploaded, debug: debugMode ? debug : undefined });
   } catch (e: any) {
 	console.error("[/api/request] error:", e);
-	return corsJson(req, { ok: false, error: e?.message || "Server error", ...(debug ? { debug: dbg } : {}) }, { status: 500 });
+	debug.fatal = e?.message || String(e);
+	return corsJson(req, { ok: false, error: debug.fatal, debug: debugMode ? debug : undefined }, { status: 500 });
   }
 }
